@@ -19,9 +19,11 @@ macro_rules! make_regex {
 
 make_regex!(HEADING_RE, r"(?m)^(#{1,6})\s+(.+)$");
 make_regex!(FENCE_RE, r"(?m)^```([0-9a-zA-Z+-_]*)\s*$");
-make_regex!(LINK_RE, r"(?m)^\[([^\]]+)\]\(([^\)]+)\)$");
+make_regex!(LINK_RE, r"(?m)\[([^\]]+)\]\(([^\)]+)\)");
+make_regex!(IMAGE_RE, r"(?m)\!\[([^\]]+)\]\(([^\)]+)\)");
 
 #[pyclass]
+#[derive(Clone)]
 pub(crate) enum Token {
     Heading { level: u8, content: String },
     Paragraph(String, Vec<Metadata>),
@@ -43,18 +45,85 @@ impl Token {
 }
 
 #[pyclass]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) enum Metadata {
     Link {
         location: (usize, usize),
         label: String,
         url: String,
     },
-    // Image {
-    //     location: (usize, usize),
-    //     label: String,
-    //     url: String,
-    // },
+    Image {
+        location: (usize, usize),
+        label: String,
+        url: String,
+    },
+}
+
+#[pymethods]
+impl Metadata {
+    #[pyo3(name = "__repr__")]
+    pub fn py_repr(&self) -> String {
+        match self {
+            Self::Link {
+                location,
+                label,
+                url,
+            } => format!("Link({location:?}, {label:?}, {url:?})"),
+            Self::Image {
+                location,
+                label,
+                url,
+            } => format!("Image({location:?}, {label:?}, {url:?})"),
+        }
+    }
+}
+
+impl std::fmt::Debug for Metadata {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.py_repr())
+    }
+}
+
+impl Metadata {
+    /// Parses and returns the link metadata(s), if any.
+    pub(crate) fn links(paragraph: &String) -> Vec<Self> {
+        let lre = LINK_RE.captures_iter(paragraph);
+
+        lre.map(|c| {
+            // Links
+            let (start, end) = {
+                let range = c.get(0).unwrap().range();
+                (range.start, range.end)
+            };
+
+            Metadata::Link {
+                location: (start, end),
+                label: c[1].to_string(),
+                url: c[2].to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+    }
+
+    /// Parses and returns the image metadata(s), if any.
+    pub(crate) fn images(paragraph: &String) -> Vec<Self> {
+        let ire = IMAGE_RE.captures_iter(paragraph);
+
+        ire.map(|c| {
+            // Links
+            let (start, end) = {
+                let range = c.get(0).unwrap().range();
+                (range.start, range.end)
+            };
+
+            Metadata::Image {
+                location: (start, end),
+                label: c[1].to_string(),
+                url: c[2].to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+    }
 }
 
 pub(crate) type Tokens = Vec<Token>;
@@ -64,12 +133,10 @@ pub(crate) type Tokens = Vec<Token>;
 /// # Example
 ///
 /// ```rust
-/// use md0::parser::*;
+/// let text = "[Google](https://google.com)".to_string();
+/// let metadata = Metadata::link(&text);
 ///
-/// let input = "# Heading";
-/// let tokens = parse(input.to_string());
-///
-/// assert_eq!(tokens[0], Token::Heading { level: 1, content: "Heading".to_string() });
+/// assert!(matches!(metadata, Some(Metadata::Link { .. })));
 /// ```
 /// # Returns
 ///
@@ -102,8 +169,6 @@ pub(crate) fn parse(input: String) -> PyResult<Tokens> {
             'collector: while i < lines.len() {
                 let line = &lines[i];
 
-                println!("{:?}", line);
-
                 if line.trim().is_empty() {
                     break 'collector;
                 }
@@ -127,7 +192,9 @@ pub(crate) fn parse(input: String) -> PyResult<Tokens> {
                         let before = &contents[..contents.len() - 1].join(" ");
                         let heading = &contents[contents.len() - 1];
 
-                        tokens.push(Token::Paragraph(before.to_string(), vec![]));
+                        if !before.is_empty() {
+                            tokens.push(Token::Paragraph(before.to_string(), vec![]));
+                        }
                         tokens.push(Token::Heading {
                             level: 1,
                             content: heading.to_string(),
@@ -150,7 +217,6 @@ pub(crate) fn parse(input: String) -> PyResult<Tokens> {
                     i += 1;
                     'code_collector: while i < lines.len() {
                         let line = &lines[i];
-                        println!("code {line:?}");
 
                         if line.trim() == "```" {
                             break 'code_collector;
@@ -178,19 +244,14 @@ pub(crate) fn parse(input: String) -> PyResult<Tokens> {
             let paragraph = contents.join(" ");
             let mut metadatas: Vec<Metadata> = vec![];
 
-            let lre = LINK_RE.captures(&paragraph);
-            if let Some(c) = lre {
-                // Links
-                let (start, end) = {
-                    let range = c.get(0).unwrap().range();
-                    (range.start, range.end)
-                };
+            // Process links
+            for item in Metadata::links(&paragraph) {
+                metadatas.push(item);
+            }
 
-                metadatas.push(Metadata::Link {
-                    location: (start, end),
-                    label: c[1].to_string(),
-                    url: c[2].to_string(),
-                })
+            // Process images
+            for item in Metadata::images(&paragraph) {
+                metadatas.push(item);
             }
 
             tokens.push(Token::Paragraph(paragraph, metadatas));
@@ -201,4 +262,29 @@ pub(crate) fn parse(input: String) -> PyResult<Tokens> {
     }
 
     Ok(tokens)
+}
+
+pub(crate) fn tokens_to_html(tokens: Tokens) -> PyResult<String> {
+    let mut contents: Vec<String> = vec![];
+
+    for item in tokens {
+        match item {
+            Token::Paragraph(s, ..) => {
+                contents.push(format!("<p>{}</p>", html_escape::encode_text(&s)))
+            }
+            Token::Code { content, .. } => contents.push(format!(
+                "<pre><code>{}</code></pre>",
+                html_escape::encode_text::<String>(&content).to_string()
+            )),
+            Token::Heading { level, content } => contents.push(format!(
+                "<h{}>{}</h{}>",
+                level,
+                html_escape::encode_text(&content),
+                level
+            )),
+            Token::HorizontalRule() => contents.push("<hr />".to_string()),
+        }
+    }
+
+    Ok(contents.join("\n"))
 }
