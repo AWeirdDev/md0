@@ -23,6 +23,7 @@ make_regex!(HEADING_RE, r"(?m)^(#{1,6})\s+(.+)$");
 pub(crate) enum Token {
     Heading { level: u8, content: String },
     Paragraph(String),
+    HorizontalRule(),
 }
 
 #[pymethods]
@@ -32,6 +33,7 @@ impl Token {
         match self {
             Self::Heading { level, content } => format!("Heading({level}, {content:?})"),
             Self::Paragraph(content) => format!("Paragraph({content:?})"),
+            Self::HorizontalRule() => "HorizontalRule".to_string(),
         }
     }
 }
@@ -59,10 +61,11 @@ pub(crate) fn parse(input: String) -> PyResult<Tokens> {
     let mut tokens: Tokens = Vec::new();
     let mut i = 0_usize;
 
-    while i < lines.len() {
+    'consumer: while i < lines.len() {
         let line = &lines[i];
 
         if line.is_empty() {
+            i += 1;
             continue;
         }
 
@@ -74,7 +77,54 @@ pub(crate) fn parse(input: String) -> PyResult<Tokens> {
                 content: c[2].to_string(),
             });
         } else {
-            tokens.push(Token::Paragraph(line.to_string()));
+            let mut contents: Vec<String> = vec![];
+
+            'collector: while i < lines.len() {
+                let line = &lines[i];
+
+                println!("{:?}", line);
+
+                if line.trim().is_empty() {
+                    break 'collector;
+                }
+
+                // We're gonna handle the "---", which is a horizontal rule or it just
+                // indicates that there's a heading above... which is stupid. idk why.
+                if line.starts_with("---") && line.trim_matches('-').is_empty() {
+                    if contents.is_empty() {
+                        tokens.push(Token::HorizontalRule());
+                    } else {
+                        // If we have something like:
+                        // ```markdown
+                        // Only one new line!
+                        // Hello, guys!
+                        // ---
+                        // ```
+                        // We should ONLY collect "Hello, guys!"
+                        // The `contents`:
+                        // ["Only one new line!", "Hello, guys!"]
+                        // So we should be getting [-1] as the heading, [:-1] as the content (before)
+
+                        let before = &contents[..contents.len() - 1].join(" ");
+                        let heading = &contents[contents.len() - 1];
+
+                        tokens.push(Token::Paragraph(before.to_string()));
+                        tokens.push(Token::Heading {
+                            level: 1,
+                            content: heading.to_string(),
+                        });
+                    }
+
+                    i += 1;
+                    continue 'consumer;
+                }
+
+                contents.push(line.to_owned());
+                i += 1;
+            }
+
+            tokens.push(Token::Paragraph(contents.join(" ")));
+            continue;
         }
 
         i += 1;
