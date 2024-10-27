@@ -18,12 +18,15 @@ macro_rules! make_regex {
 }
 
 make_regex!(HEADING_RE, r"(?m)^(#{1,6})\s+(.+)$");
+make_regex!(FENCE_RE, r"(?m)^```([0-9a-zA-Z+-_]*)\s*$");
+make_regex!(LINK_RE, r"(?m)^\[([^\]]+)\]\(([^\)]+)\)$");
 
 #[pyclass]
 pub(crate) enum Token {
     Heading { level: u8, content: String },
-    Paragraph(String),
+    Paragraph(String, Vec<Metadata>),
     HorizontalRule(),
+    Code { language: String, content: String },
 }
 
 #[pymethods]
@@ -32,10 +35,26 @@ impl Token {
     pub fn py_repr(&self) -> String {
         match self {
             Self::Heading { level, content } => format!("Heading({level}, {content:?})"),
-            Self::Paragraph(content) => format!("Paragraph({content:?})"),
+            Self::Paragraph(content, meta) => format!("Paragraph({content:?}, {meta:?})"),
             Self::HorizontalRule() => "HorizontalRule".to_string(),
+            Self::Code { language, content } => format!("Code({language:?}, {content:?})"),
         }
     }
+}
+
+#[pyclass]
+#[derive(Clone, Debug)]
+pub(crate) enum Metadata {
+    Link {
+        location: (usize, usize),
+        label: String,
+        url: String,
+    },
+    // Image {
+    //     location: (usize, usize),
+    //     label: String,
+    //     url: String,
+    // },
 }
 
 pub(crate) type Tokens = Vec<Token>;
@@ -66,12 +85,13 @@ pub(crate) fn parse(input: String) -> PyResult<Tokens> {
 
         if line.is_empty() {
             i += 1;
-            continue;
+            continue 'consumer;
         }
 
-        let h = HEADING_RE.captures(&line);
+        let hre = HEADING_RE.captures(&line);
 
-        if let Some(c) = h {
+        // Heading
+        if let Some(c) = hre {
             tokens.push(Token::Heading {
                 level: c[1].to_string().len() as u8,
                 content: c[2].to_string(),
@@ -88,8 +108,7 @@ pub(crate) fn parse(input: String) -> PyResult<Tokens> {
                     break 'collector;
                 }
 
-                // We're gonna handle the "---", which is a horizontal rule or it just
-                // indicates that there's a heading above... which is stupid. idk why.
+                // "---" handling (horizontal rule or heading)
                 if line.starts_with("---") && line.trim_matches('-').is_empty() {
                     if contents.is_empty() {
                         tokens.push(Token::HorizontalRule());
@@ -108,7 +127,7 @@ pub(crate) fn parse(input: String) -> PyResult<Tokens> {
                         let before = &contents[..contents.len() - 1].join(" ");
                         let heading = &contents[contents.len() - 1];
 
-                        tokens.push(Token::Paragraph(before.to_string()));
+                        tokens.push(Token::Paragraph(before.to_string(), vec![]));
                         tokens.push(Token::Heading {
                             level: 1,
                             content: heading.to_string(),
@@ -119,11 +138,62 @@ pub(crate) fn parse(input: String) -> PyResult<Tokens> {
                     continue 'consumer;
                 }
 
+                let fre = FENCE_RE.captures(&line);
+
+                if let Some(c) = fre {
+                    tokens.push(Token::Paragraph(contents.join(" "), vec![]));
+                    contents.clear();
+
+                    let language = c[1].to_string();
+                    let mut code = String::new();
+
+                    i += 1;
+                    'code_collector: while i < lines.len() {
+                        let line = &lines[i];
+                        println!("code {line:?}");
+
+                        if line.trim() == "```" {
+                            break 'code_collector;
+                        }
+
+                        code += line;
+                        code += "\n";
+
+                        i += 1;
+                    }
+
+                    tokens.push(Token::Code {
+                        language,
+                        content: code,
+                    });
+
+                    i += 1;
+                    continue 'consumer;
+                }
+
                 contents.push(line.to_owned());
                 i += 1;
             }
 
-            tokens.push(Token::Paragraph(contents.join(" ")));
+            let paragraph = contents.join(" ");
+            let mut metadatas: Vec<Metadata> = vec![];
+
+            let lre = LINK_RE.captures(&paragraph);
+            if let Some(c) = lre {
+                // Links
+                let (start, end) = {
+                    let range = c.get(0).unwrap().range();
+                    (range.start, range.end)
+                };
+
+                metadatas.push(Metadata::Link {
+                    location: (start, end),
+                    label: c[1].to_string(),
+                    url: c[2].to_string(),
+                })
+            }
+
+            tokens.push(Token::Paragraph(paragraph, metadatas));
             continue;
         }
 
